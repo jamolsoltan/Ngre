@@ -22,7 +22,7 @@
 if [ -f "$0" ] && grep -q $'\r' "$0" 2>/dev/null; then if [ -w "$0" ] && sed -i 's/\r$//' "$0"; then echo "Windows line endings fixed in $0 - starting again..."; exec bash "$0" "$@"; else printf '%s\n' "This file has Windows line endings. Run: sed -i 's/\r\$//' $0"; exit 1; fi; fi #
 if [ -f "$0" ] && [ "$(tail -n 1 "$0" 2>/dev/null)" != "# ngre:eof" ]; then echo "This copy of ngre is incomplete (the upload/download was cut). Upload the whole file again."; exit 1; fi #
 
-SCRIPT_VERSION="v1.3.4"
+SCRIPT_VERSION="v1.3.5"
 
 # GitHub repository (format: username/repository). Used by
 #   bash <(curl -Ls --ipv4 https://raw.githubusercontent.com/jamolsoltan/Ngre/main/ngre.sh)
@@ -1000,24 +1000,81 @@ NGX_LAST_ERROR=""
 
 ngx_bin() { bin_path nginx; }
 
+# nginx -t on a tiny config: does LINE (a load_module line, or nothing when the
+# module is built in) give nginx a working "stream" block?
+ngx_stream_try() {
+    local nb="$1" line="$2" d rc
+    d="$(mktemp -d 2>/dev/null)" || return 1
+    printf '%s\nerror_log %s/e.log;\npid %s/p.pid;\nevents { }\nstream { }\n' "$line" "$d" "$d" > "$d/t.conf"
+    "$nb" -t -q -p "$d" -c "$d/t.conf" >/dev/null 2>&1; rc=$?
+    rm -rf "$d"
+    return "$rc"
+}
+
+# Prints what the Ngre nginx config needs to get the stream module:
+# a load_module line, or a comment when it is built in. Every candidate is
+# verified with "nginx -t" (distros put the module in different places).
+NGX_STREAM_LINE=""
 ngx_stream_load_line() {
-    local nb v p
+    local nb v d f p prefix line
+    local -a dirs=() cands=()
+    declare -A seen=()
+    [[ -n "$NGX_STREAM_LINE" ]] && { echo "$NGX_STREAM_LINE"; return 0; }
     nb="$(ngx_bin)" || return 1
     v="$("$nb" -V 2>&1)"
-    if grep -qE -- '--with-stream=dynamic( |$)' <<<"$v"; then
-        for p in /usr/lib/nginx/modules /usr/lib64/nginx/modules /usr/share/nginx/modules \
-                 /etc/nginx/modules /usr/local/nginx/modules; do
-            if [[ -f "$p/ngx_stream_module.so" ]]; then
-                echo "load_module $p/ngx_stream_module.so;"
+    prefix="/usr/share/nginx"
+    [[ "$v" =~ --prefix=([^[:space:]]+) ]] && prefix="${BASH_REMATCH[1]}"
+    # built in (static): nothing to load
+    grep -qE -- '--with-stream( |$)' <<<"$v" && cands+=("")
+    # the module file where this nginx / the distro keeps modules
+    [[ "$v" =~ --modules-path=([^[:space:]]+) ]] && dirs+=("${BASH_REMATCH[1]}")
+    dirs+=("$prefix/modules" /usr/lib/nginx/modules /usr/lib64/nginx/modules /usr/share/nginx/modules
+           /etc/nginx/modules /usr/local/nginx/modules /usr/local/lib/nginx/modules)
+    for d in "${dirs[@]}"; do
+        [[ -f "$d/ngx_stream_module.so" ]] && cands+=("load_module $d/ngx_stream_module.so;")
+    done
+    # what the distro's own module snippets load
+    for f in /etc/nginx/modules-enabled/*.conf /usr/share/nginx/modules-available/*.conf; do
+        [[ -f "$f" ]] || continue
+        p="$(grep -oE 'load_module[[:space:]]+[^;]*ngx_stream_module\.so' "$f" 2>/dev/null | awk '{print $2}' | head -1)"
+        [[ -z "$p" ]] && continue
+        [[ "$p" == /* ]] || p="$prefix/$p"
+        [[ -f "$p" ]] && cands+=("load_module $p;")
+    done
+    local round
+    for round in 1 2; do
+        if (( round == 2 )); then
+            # slower: anywhere else it may have been installed, or built in without being listed
+            cands=()
+            while IFS= read -r p; do
+                [[ -n "$p" ]] && cands+=("load_module $p;")
+            done < <(find /usr /opt -name ngx_stream_module.so -type f 2>/dev/null | head -5)
+            cands+=("")
+        fi
+        for line in "${cands[@]}"; do
+            [[ -n "${seen[x$line]:-}" ]] && continue
+            seen[x$line]=1
+            if ngx_stream_try "$nb" "$line"; then
+                NGX_STREAM_LINE="${line:-# stream module is built into this nginx}"
+                echo "$NGX_STREAM_LINE"
                 return 0
             fi
         done
-        return 1
-    elif grep -qE -- '--with-stream( |$)' <<<"$v"; then
-        echo "# stream module is built into this nginx"
-        return 0
-    fi
+    done
     return 1
+}
+
+# What was found, for the error message when the stream module can't be used
+ngx_stream_diag() {
+    local nb
+    nb="$(ngx_bin)" || { echo "nginx binary not found"; return; }
+    echo "nginx: $("$nb" -v 2>&1 | head -1 | safe_text)"
+    echo "build flags: $("$nb" -V 2>&1 | tr ' ' '\n' | grep -E -- '--with-stream(=|$)' | tr '\n' ' ' | safe_text)"
+    echo "module files: $(find /usr /opt /etc/nginx -name 'ngx_stream_module.so' 2>/dev/null | head -3 | tr '\n' ' ' | safe_text)"
+    local d; d="$(mktemp -d 2>/dev/null)" && {
+        printf 'error_log %s/e.log;\npid %s/p.pid;\nevents { }\nstream { }\n' "$d" "$d" > "$d/t.conf"
+        echo "nginx -t: $("$nb" -t -p "$d" -c "$d/t.conf" 2>&1 | grep -E 'emerg|error' | head -2 | tr '\n' ' ' | safe_text)"
+        rm -rf "$d"; }
 }
 
 ngx_user() {
@@ -1070,7 +1127,8 @@ ensure_nginx() {
         esac
         [[ -n "$PKG_ERROR" ]] && ! ngx_stream_load_line >/dev/null && echo "$PKG_ERROR" | sed 's/^/      /'
         if ! ngx_stream_load_line >/dev/null; then
-            fail "nginx stream module is not available. Install it manually: apt install libnginx-mod-stream"
+            fail "The nginx stream module could not be loaded. Details (please report them):"
+            ngx_stream_diag | sed 's/^/      /'
             return 1
         fi
     fi
