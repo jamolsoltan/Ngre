@@ -13,7 +13,7 @@
 #     ip addr add <tunnel-ip>/30 dev <iface>
 #     ip link set <iface> mtu 1476 up
 #   IRAN side forwards ports with nginx stream:
-#     TCP  -> proxy_timeout 600s
+#     TCP  -> proxy_timeout 600s, proxy_connect_timeout 10s
 #     UDP  -> proxy_timeout 60s
 #
 #   Run as root:  bash ngre.sh   (after the first run just type: ngre)
@@ -22,7 +22,7 @@
 if [ -f "$0" ] && grep -q $'\r' "$0" 2>/dev/null; then if [ -w "$0" ] && sed -i 's/\r$//' "$0"; then echo "Windows line endings fixed in $0 - starting again..."; exec bash "$0" "$@"; else printf '%s\n' "This file has Windows line endings. Run: sed -i 's/\r\$//' $0"; exit 1; fi; fi #
 if [ -f "$0" ] && [ "$(tail -n 1 "$0" 2>/dev/null)" != "# ngre:eof" ]; then echo "This copy of ngre is incomplete (the upload/download was cut). Upload the whole file again."; exit 1; fi #
 
-SCRIPT_VERSION="v1.3.5"
+SCRIPT_VERSION="v1.3.6"
 
 # GitHub repository (format: username/repository). Used by
 #   bash <(curl -Ls --ipv4 https://raw.githubusercontent.com/jamolsoltan/Ngre/main/ngre.sh)
@@ -65,6 +65,7 @@ LOGROTATE_FILE="/etc/logrotate.d/ngre"
 DEFAULT_MTU=1476
 GRE_TTL=255
 TCP_PROXY_TIMEOUT="600s"
+TCP_CONNECT_TIMEOUT="10s"
 UDP_PROXY_TIMEOUT="60s"
 MAX_TOTAL_PORTS=10000       # all listen ports of all IRAN tunnels (nginx socket budget)
 
@@ -964,6 +965,13 @@ iface_up() {
     [[ -d "/sys/class/net/$1" ]] && ip link show "$1" 2>/dev/null | head -1 | grep -qE '[<,]UP[,>]'
 }
 
+# same check without starting a process (the watchdog does it every round)
+iface_flags_up() {
+    local fl
+    { read -r fl < "/sys/class/net/$1/flags"; } 2>/dev/null || return 1
+    [[ "$fl" =~ ^0x[0-9a-fA-F]+$ ]] && (( fl & 1 ))
+}
+
 # ping the other end of the tunnel; prints RTT in ms (empty if no reply)
 tunnel_ping_ms() {
     ping -c "${2:-1}" -W 2 -i 0.3 -q "$1" 2>/dev/null | awk -F'/' '/^rtt|^round-trip/ {if ($5 < 1) printf "%.2f", $5; else printf "%.1f", $5}'
@@ -975,11 +983,66 @@ parallel_ping() {
     local d="$1" count="$2" i=0 ip
     shift 2
     for ip in "$@"; do
-        ( r="$(tunnel_ping_ms "$ip" "$count")"; [[ -n "$r" ]] && echo "$r" > "$d/$i" ) &
+        # an empty entry is skipped but keeps its index
+        [[ -n "$ip" ]] && ( r="$(tunnel_ping_ms "$ip" "$count")"; [[ -n "$r" ]] && echo "$r" > "$d/$i" ) &
         i=$((i + 1))
         (( i % 64 == 0 )) && wait
     done
     wait
+}
+
+# Does anything at IP:PORT answer a TCP connection attempt - accepted OR
+# refused?  Either answer proves that packets travel BOTH ways through the
+# tunnel, also when the other server ignores ping.  No answer in 2 s means no.
+tcp_answers() {
+    local out rc
+    out="$(timeout 2 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$1" "$2" 2>&1)"; rc=$?
+    (( rc == 0 )) || [[ "$out" == *"Connection refused"* ]]
+}
+
+# TCP port for that check: on IRAN the first KHAREJ service port (it has to be
+# reachable through the tunnel anyway), on KHAREJ the tunnel port (normally
+# nothing listens there on IRAN -> answered with a refusal)
+tunnel_probe_port() {
+    local p=""
+    [[ "$T_ROLE" == "iran" ]] && p="$(spec_targets "$T_PORTS" | head -1)"
+    is_uint "$p" || p="$T_TUNNEL_PORT"
+    echo "$p"
+}
+
+#   parallel_tcp DIR ip:port ...  -> DIR/tcp<index> exists for each one that
+#   answered.  Empty arguments are skipped but keep their index.
+parallel_tcp() {
+    local d="$1" i=0 t
+    shift
+    for t in "$@"; do
+        if [[ -n "$t" ]]; then
+            ( tcp_answers "${t%:*}" "${t##*:}" && : > "$d/tcp$i" ) &
+        fi
+        i=$((i + 1))
+        (( i % 64 == 0 )) && wait
+    done
+    wait
+}
+
+# Why a tunnel gets no answer, judged from what this server can see.
+#   gre_diag PACKETS_ARRIVE(0/1) PUBLIC_IP_ANSWERS(0/1) OTHER_SERVER_IP
+gre_diag() {
+    if (( $1 )); then
+        echo "packets from $3 still arrive here, but ours do not reach it (one-way): the network path (datacenter/ISP) drops GRE from this server to $3, or the tunnel on $3 points to another IP"
+    elif (( $2 )); then
+        echo "$3 is online (its public IP answers ping) but no GRE passes in either direction: GRE (protocol 47) is blocked on the path or by a datacenter firewall, or the tunnel on $3 is down"
+    else
+        echo "$3 does not answer ping on its public IP either: it is offline, its network is down, or it blocks ping"
+    fi
+}
+
+fmt_dur() {
+    local s="$1"
+    if (( s >= 3600 )); then printf '%dh %02dm' $(( s / 3600 )) $(( s % 3600 / 60 ))
+    elif (( s >= 60 )); then printf '%dm %02ds' $(( s / 60 )) $(( s % 60 ))
+    else printf '%ds' "$s"
+    fi
 }
 
 make_tmpdir() {
@@ -1154,6 +1217,8 @@ events {
 }
 
 stream {
+    # a dead tunnel must fail fast (nginx default: 60 s), so clients retry quickly
+    proxy_connect_timeout $TCP_CONNECT_TIMEOUT;
     include $NGX_STREAMS/*.conf;
 }
 EOF
@@ -2832,10 +2897,30 @@ test_tunnel() {
         else
             warn "Full-size packets (MTU ${T_MTU}) are dropped - try a lower MTU (e.g. 1420) on BOTH servers"
         fi
+    elif tcp_answers "$T_REMOTE_TUN_IP" "$(tunnel_probe_port)"; then
+        ok "No ping reply from ${peer_label} ${T_REMOTE_TUN_IP}, but it answers TCP: the tunnel works (that server ignores ping)"
+        avg="tcp"
     else
         fail "No reply from ${peer_label} ${T_REMOTE_TUN_IP}"
-        echo "      Check: the other server has tunnel port ${T_TUNNEL_PORT} configured,"
-        echo "      GRE (protocol 47) is allowed by both firewalls / the datacenter."
+        info "Looking for the reason (about 6 seconds)..."
+        local r1 r2 rx=0 pubok=0
+        r1="$(cat "/sys/class/net/$T_IFACE/statistics/rx_packets" 2>/dev/null)"
+        ping -c 3 -i 0.5 -W 2 -q "$T_REMOTE_IP" >/dev/null 2>&1 && pubok=1
+        sleep 4
+        r2="$(cat "/sys/class/net/$T_IFACE/statistics/rx_packets" 2>/dev/null)"
+        is_uint "$r1" && is_uint "$r2" && (( r2 > r1 )) && rx=1
+        if (( rx )); then ok "GRE packets from ${T_REMOTE_IP} arrive on ${T_IFACE}"
+        else fail "No GRE packets from ${T_REMOTE_IP} arrive on ${T_IFACE}"
+        fi
+        if (( pubok )); then ok "${T_REMOTE_IP} answers ping on its public IP"
+        else warn "${T_REMOTE_IP} does not answer ping on its public IP"
+        fi
+        echo
+        colorize yellow "  Reason: $(gre_diag "$rx" "$pubok" "$T_REMOTE_IP")"
+        echo "      Run 'Test this tunnel' on ${T_REMOTE_IP} too: its view of the other direction"
+        echo "      completes the picture. Also check there: tunnel port ${T_TUNNEL_PORT} exists with"
+        echo "      the other server = ${T_LOCAL_IP}, and GRE (protocol 47) is allowed by the"
+        echo "      datacenter/cloud firewall (e.g. Hetzner: add an inbound rule for GRE)."
     fi
 
     if [[ "$T_ROLE" == "iran" ]]; then
@@ -2949,6 +3034,15 @@ check_tunnel_status() {
     done
     tmpd="$(make_tmpdir)"
     parallel_ping "$tmpd" 1 "${peers[@]}"
+    # no ping reply: the other server may just ignore ping -> try TCP
+    local -a tcpt=()
+    for i in "${!valid[@]}"; do
+        if [[ ! -f "$tmpd/$i" ]] && load_tunnel "${valid[$i]}"; then tcpt+=("$T_REMOTE_TUN_IP:$(tunnel_probe_port)")
+        else tcpt+=("")
+        fi
+    done
+    parallel_tcp "$tmpd" "${tcpt[@]}"
+    local noreply=0
     printf "%-7s %-7s %-10s %-16s %-15s %-9s %-6s %s\n" "PORT" "ROLE" "IFACE" "OTHER SERVER" "TUNNEL IP" "SERVICE" "LINK" "PING"
     for i in "${!valid[@]}"; do
         load_tunnel "${valid[$i]}" || continue
@@ -2957,12 +3051,19 @@ check_tunnel_status() {
         [[ "$svc" == "active" ]] && sc=$GREEN || sc=$RED
         if iface_up "$T_IFACE"; then link="UP"; lc=$GREEN; else link="DOWN"; lc=$RED; fi
         ping_ms="$(cat "$tmpd/$i" 2>/dev/null)"
-        if [[ -n "$ping_ms" ]]; then ping_ms="${ping_ms} ms"; pc=$GREEN; else ping_ms="no reply"; pc=$RED; fi
+        if [[ -n "$ping_ms" ]]; then ping_ms="${ping_ms} ms"; pc=$GREEN
+        elif [[ -f "$tmpd/tcp$i" ]]; then ping_ms="no ping, TCP ok"; pc=$YELLOW
+        else ping_ms="no reply"; pc=$RED; noreply=1
+        fi
         printf "%-7s %-7s %-10s %-16s %-15s " "$T_TUNNEL_PORT" "${T_ROLE^^}" "$T_IFACE" "$T_REMOTE_IP" "$T_LOCAL_TUN_IP"
         printf "${sc}%-9s${NC} ${lc}%-6s${NC} ${pc}%s${NC}\n" "$svc" "$link" "$ping_ms"
         [[ "$T_ROLE" == "iran" ]] && echo -e "        ${DIM}ports: ${T_PORTS}${NC}"
     done
     rm -rf "${tmpd:?}"
+    if (( noreply )); then
+        echo
+        info "Why a tunnel gets no answer: ngre -> 2 -> the tunnel -> Test this tunnel"
+    fi
     if (( $(iran_tunnel_count) > 0 )); then
         echo
         if systemctl is-active --quiet "$NGX_SERVICE" 2>/dev/null; then ok "Nginx engine (${NGX_SERVICE}) is running"
@@ -3087,9 +3188,10 @@ wd_unlock() {
 }
 
 watchdog_loop() {
-    declare -A fails=() last_restart=() backoff=() lastrx=()
-    local f now wait b n rxnow alive engine_fail_logged=0 tmpd i
-    local -a wf=() wpeer=()
+    declare -A fails=() last_restart=() backoff=() lastrx=() rxseen=() fail_since=()
+    local f now wait b n rxnow rxgrew alive engine_fail_logged=0 tmpd i j ndown npeers pub_ok
+    local srv_down=0 srv_since=0 d allir upcnt srvcut
+    local -a wf=() wpeer=() wport=() wpub=() wrxpre=() wup=() wtcp=() newdown=() pubidx=() pubip=()
     ssq -ltn >/dev/null 2>&1
     trap 'rm -rf "${tmpd:-/nonexistent}"; exit 0' TERM INT HUP
     clean_stale_tmp
@@ -3102,65 +3204,152 @@ watchdog_loop() {
     while true; do
         load_global
         if (( WATCHDOG_ENABLED == 0 )); then sleep 30; continue; fi
-
         # 1) enabled tunnels (tunnels stopped by the user are left alone)
-        wf=(); wpeer=()
+        wf=(); wpeer=(); wport=(); wpub=(); wrxpre=(); wup=(); allir=1
         while read -r f; do
             load_tunnel "$f" || continue
             if ! systemctl is-enabled --quiet "$T_UNIT" 2>/dev/null; then
                 fails[$T_NAME]=0; continue
             fi
-            wf+=("$f"); wpeer+=("$T_REMOTE_TUN_IP")
+            wf+=("$f"); wport+=("$(tunnel_probe_port)"); wpub+=("$T_REMOTE_IP")
+            # our own tunnel interface gone or down: dead, nothing to ask
+            # (a ping would even leave through the main interface)
+            if iface_flags_up "$T_IFACE"; then wpeer+=("$T_REMOTE_TUN_IP"); wup+=(1); else wpeer+=(""); wup+=(0); fi
+            [[ "$T_ROLE" == "iran" ]] || allir=0
+            rxnow="$(cat "/sys/class/net/$T_IFACE/statistics/rx_packets" 2>/dev/null)"
+            is_uint "$rxnow" || rxnow=-1
+            wrxpre+=("$rxnow")
         done < <(list_tunnel_files)
 
-        # 2) ping all of them at the same time
+        # 2) ping all of them at the same time; no reply -> try TCP (the other
+        #    server may ignore ping).  Only an ANSWER counts as alive: packets
+        #    that merely arrive from the other side prove nothing, they keep
+        #    arriving when just our direction is blocked (one-way failure).
         tmpd="$(make_tmpdir)"
         parallel_ping "$tmpd" 2 "${wpeer[@]}"
+        wtcp=()
+        for i in "${!wf[@]}"; do
+            if [[ -f "$tmpd/$i" || -z "${wpeer[$i]}" ]]; then wtcp+=(""); else wtcp+=("${wpeer[$i]}:${wport[$i]}"); fi
+        done
+        parallel_tcp "$tmpd" "${wtcp[@]}"
 
         # 3) evaluate
+        newdown=(); ndown=0
         for i in "${!wf[@]}"; do
             f="${wf[$i]}"
             load_tunnel "$f" || continue
             n="$T_NAME"
             alive=0
-            [[ -f "$tmpd/$i" ]] && alive=1
-            # RX counter sampled after the ping, so replies to our own pings never
-            # count as "traffic from the peer" in the next round
-            rxnow="$(cat "/sys/class/net/$T_IFACE/statistics/rx_bytes" 2>/dev/null)"
+            [[ -f "$tmpd/$i" || -f "$tmpd/tcp$i" ]] && alive=1
+            # did packets from the other side arrive while it did not answer?
+            # (only used to explain an outage)
+            rxnow="$(cat "/sys/class/net/$T_IFACE/statistics/rx_packets" 2>/dev/null)"
             is_uint "$rxnow" || rxnow=-1
-            if (( alive == 0 && rxnow >= 0 )) && [[ -n "${lastrx[$n]:-}" ]] && (( lastrx[$n] >= 0 && rxnow > lastrx[$n] )); then
-                # no ping reply, but packets keep arriving from the peer (ICMP may be blocked)
-                alive=1
+            rxgrew=0
+            if (( rxnow >= 0 )); then
+                (( wrxpre[i] >= 0 && rxnow > wrxpre[i] )) && rxgrew=1
+                (( ${fails[$n]:-0} > 0 )) && [[ -n "${lastrx[$n]:-}" ]] && (( lastrx[$n] >= 0 && rxnow > lastrx[$n] )) && rxgrew=1
             fi
             lastrx[$n]=$rxnow
             if (( alive )); then
                 if (( ${fails[$n]:-0} >= WATCHDOG_FAILS )); then
-                    wd_log "[$n] RECOVERED: ${T_REMOTE_TUN_IP} answers again"
+                    d=""
+                    [[ -n "${fail_since[$n]:-}" ]] && d=" (down about $(fmt_dur $(( $(mono_s) - fail_since[$n] ))))"
+                    wd_log "[$n] RECOVERED: ${T_REMOTE_TUN_IP} answers again$d"
                     log INFO "Watchdog: tunnel $n recovered"
                 fi
-                fails[$n]=0; backoff[$n]=0; unset "last_restart[$n]"
+                fails[$n]=0; backoff[$n]=0; rxseen[$n]=0; unset "last_restart[$n]" "fail_since[$n]"
                 continue
             fi
             fails[$n]=$(( ${fails[$n]:-0} + 1 ))
-            (( fails[$n] == WATCHDOG_FAILS )) && \
-                wd_log "[$n] DOWN: no reply from ${T_REMOTE_TUN_IP} (${WATCHDOG_FAILS} checks failed)"
-            if (( fails[$n] >= WATCHDOG_FAILS )); then
-                now=$(mono_s)
-                b=${backoff[$n]:-0}
-                wait=$(( WATCHDOG_INTERVAL * WATCHDOG_FAILS * (2 ** b) ))
-                (( wait > 600 )) && wait=600
-                # (uptime clock: the first restart must not wait for "uptime > wait")
-                if { [[ -z "${last_restart[$n]:-}" ]] || (( now - last_restart[$n] >= wait )); } && wd_lock; then
-                    # re-check: the user may have stopped or removed it meanwhile
-                    if [[ -f "$f" ]] && systemctl is-enabled --quiet "$T_UNIT" 2>/dev/null; then
-                        unit_now restart "$T_UNIT"
-                        wd_log "[$n] restarted ${T_UNIT} (attempt $(( b + 1 )))"
-                        log WARN "Watchdog restarted tunnel $n (no reply from ${T_REMOTE_TUN_IP})"
-                        last_restart[$n]=$now
-                        (( b < 6 )) && backoff[$n]=$(( b + 1 ))
-                    fi
-                    wd_unlock
+            if (( fails[$n] == 1 )); then rxseen[$n]=$rxgrew; fail_since[$n]=$(mono_s)
+            elif (( rxgrew )); then rxseen[$n]=1
+            fi
+            (( fails[$n] == WATCHDOG_FAILS )) && newdown+=("$i")
+            (( fails[$n] >= WATCHDOG_FAILS )) && ndown=$(( ndown + 1 ))
+        done
+
+        # 4) newly down: say why.  All tunnels (to 2+ different servers) down
+        #    together -> the cause is this server's own network, not the tunnels.
+        npeers="$(printf '%s\n' "${wpub[@]}" | sort -u | grep -c .)"
+        upcnt=0; for i in "${!wup[@]}"; do (( wup[i] )) && upcnt=$(( upcnt + 1 )); done
+        # (missing interfaces are a local fault the restarts repair - not a network cut)
+        srvcut=0
+        (( ${#wf[@]} >= 2 && npeers >= 2 && ndown == ${#wf[@]} && upcnt == ${#wf[@]} )) && srvcut=1
+        pubidx=()
+        if (( srv_down == 0 && srvcut )); then
+            pubidx=("${!wf[@]}")
+        elif (( ${#newdown[@]} )); then
+            pubidx=("${newdown[@]}")
+        fi
+        if (( ${#pubidx[@]} )); then
+            mkdir -p "$tmpd/pub"
+            pubip=()
+            for i in "${pubidx[@]}"; do pubip+=("${wpub[$i]}"); done
+            parallel_ping "$tmpd/pub" 2 "${pubip[@]}"
+            for j in "${!pubidx[@]}"; do
+                [[ -f "$tmpd/pub/$j" ]] && : > "$tmpd/pubok${pubidx[$j]}"
+            done
+        fi
+        for i in "${newdown[@]}"; do
+            load_tunnel "${wf[$i]}" || continue
+            if (( wup[i] )); then
+                d="$(gre_diag "${rxseen[$T_NAME]:-0}" "$([[ -f "$tmpd/pubok$i" ]] && echo 1 || echo 0)" "$T_REMOTE_IP")"
+            else
+                d="the tunnel interface ${T_IFACE} on this server is missing or down"
+            fi
+            wd_log "[$T_NAME] DOWN: no reply from ${T_REMOTE_TUN_IP} (${WATCHDOG_FAILS} checks failed) - $d"
+        done
+        if (( srv_down == 0 && srvcut )); then
+            srv_down=1; srv_since=$(mono_s)
+            # the outage started when the first of them stopped answering
+            for i in "${!wf[@]}"; do
+                load_tunnel "${wf[$i]}" || continue
+                [[ -n "${fail_since[$T_NAME]:-}" ]] && (( fail_since[$T_NAME] < srv_since )) && srv_since=${fail_since[$T_NAME]}
+            done
+            pub_ok=0
+            for i in "${!wf[@]}"; do [[ -f "$tmpd/pubok$i" ]] && pub_ok=$(( pub_ok + 1 )); done
+            if (( allir )); then
+                # IRAN server, the KHAREJ servers are in different places
+                d="the cause is this server's own network, not the tunnels"
+                if (( pub_ok > 0 )); then d+=". Public IPs answering ping: ${pub_ok}/${#wf[@]} -> GRE (protocol 47) is blocked or cut on this server's network (datacenter/ISP), normal internet still works"
+                else d+=". Public IPs answering ping: 0/${#wf[@]} -> this server has no connection to them at all right now (datacenter/ISP outage)"
                 fi
+            else
+                # KHAREJ side: all IRAN servers may be cut at once (nationwide disruption)
+                d="the network of this server or of the other side is cut, not the tunnels"
+                if (( pub_ok > 0 )); then d+=". Public IPs answering ping: ${pub_ok}/${#wf[@]} -> GRE (protocol 47) is blocked on the way, normal internet still works"
+                else d+=". Public IPs answering ping: 0/${#wf[@]} -> they are not reachable at all (network outage on either side)"
+                fi
+            fi
+            wd_log "[server] ALL ${#wf[@]} tunnels are down (to $npeers different servers) - $d"
+            log WARN "Watchdog: all tunnels down at once ($pub_ok/${#wf[@]} public IPs answer)"
+        elif (( srv_down && ndown < ${#wf[@]} )); then
+            srv_down=0
+            wd_log "[server] tunnels answer again - the outage of this server's network lasted about $(fmt_dur $(( $(mono_s) - srv_since )))"
+        fi
+
+        # 5) restart the tunnels that stay down (spaced out more and more)
+        for i in "${!wf[@]}"; do
+            f="${wf[$i]}"
+            load_tunnel "$f" || continue
+            n="$T_NAME"
+            (( ${fails[$n]:-0} >= WATCHDOG_FAILS )) || continue
+            now=$(mono_s)
+            b=${backoff[$n]:-0}
+            wait=$(( WATCHDOG_INTERVAL * WATCHDOG_FAILS * (2 ** b) ))
+            (( wait > 600 )) && wait=600
+            # (uptime clock: the first restart must not wait for "uptime > wait")
+            if { [[ -z "${last_restart[$n]:-}" ]] || (( now - last_restart[$n] >= wait )); } && wd_lock; then
+                # re-check: the user may have stopped or removed it meanwhile
+                if [[ -f "$f" ]] && systemctl is-enabled --quiet "$T_UNIT" 2>/dev/null; then
+                    unit_now restart "$T_UNIT"
+                    wd_log "[$n] restarted ${T_UNIT} (attempt $(( b + 1 )))"
+                    log WARN "Watchdog restarted tunnel $n (no reply from ${T_REMOTE_TUN_IP})"
+                    last_restart[$n]=$now
+                    (( b < 6 )) && backoff[$n]=$(( b + 1 ))
+                fi
+                wd_unlock
             fi
         done
         rm -rf "${tmpd:?}"
