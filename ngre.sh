@@ -15,6 +15,8 @@
 #   IRAN side forwards ports with nginx stream:
 #     TCP  -> proxy_timeout 600s, proxy_connect_timeout 10s
 #     UDP  -> proxy_timeout 60s
+#   Extras: speed test through a tunnel (iperf3, tunnel menu 10) and an
+#   optional TCP optimization (bigger buffers + BBR, main menu 10).
 #
 #   Run as root:  bash ngre.sh   (after the first run just type: ngre)
 #
@@ -22,7 +24,7 @@
 if [ -f "$0" ] && grep -q $'\r' "$0" 2>/dev/null; then if [ -w "$0" ] && sed -i 's/\r$//' "$0"; then echo "Windows line endings fixed in $0 - starting again..."; exec bash "$0" "$@"; else printf '%s\n' "This file has Windows line endings. Run: sed -i 's/\r\$//' $0"; exit 1; fi; fi #
 if [ -f "$0" ] && [ "$(tail -n 1 "$0" 2>/dev/null)" != "# ngre:eof" ]; then echo "This copy of ngre is incomplete (the upload/download was cut). Upload the whole file again."; exit 1; fi #
 
-SCRIPT_VERSION="v1.3.6"
+SCRIPT_VERSION="v1.4.1"
 
 # GitHub repository (format: username/repository). Used by
 #   bash <(curl -Ls --ipv4 https://raw.githubusercontent.com/jamolsoltan/Ngre/main/ngre.sh)
@@ -61,6 +63,25 @@ NGX_PID="/run/ngre-nginx.pid"
 LOCK_FILE="/run/ngre.lock"
 MODULES_LOAD_FILE="/etc/modules-load.d/ngre.conf"
 LOGROTATE_FILE="/etc/logrotate.d/ngre"
+POLICY_RC="/usr/sbin/policy-rc.d"
+PROC_SYS="/proc/sys"
+SYSCTL_D="/etc/sysctl.d"
+SYSCTL_CONF="/etc/sysctl.conf"
+IPERF3_BIN="iperf3"
+MEMINFO="/proc/meminfo"
+
+# Network optimization (main menu 10): files Ngre owns
+OPT_FILE="$SYSCTL_D/99-zz-ngre-tcp.conf"        # sorts after 99-sysctl.conf: applied last at boot
+OPT_MOD_FILE="${MODULES_LOAD_FILE%/*}/ngre-tcp.conf"
+OPT_BEFORE="$NGRE_DIR/tcp-before.conf"          # values from before, for "Remove"
+OPT_KEYS=(net.core.rmem_max net.core.wmem_max net.ipv4.tcp_rmem net.ipv4.tcp_wmem
+          net.ipv4.tcp_congestion_control net.core.default_qdisc)
+
+# Speed test (tunnel menu 10)
+IPERF_PORT=5201
+IPERF_SECONDS=5             # per direction (plus 1 s warm-up that is not counted)
+IPERF_WAIT_MAX=600          # a waiting test server stops by itself after 10 minutes
+IPERF_RUN_DIR="${LOCK_FILE%/*}"
 
 DEFAULT_MTU=1476
 GRE_TTL=255
@@ -1147,17 +1168,21 @@ ngx_user() {
     fi
 }
 
+# While apt installs a package: do not let it start the package's own service
+# (the system nginx could fight over port 80, an iperf3 service would be open to
+# the internet).   policy_rc_block -> 0 if WE created the file (remove it after)
+policy_rc_block() {
+    [[ "$PKG_MGR" == "apt" && ! -e "$POLICY_RC" ]] || return 1
+    printf '#!/bin/sh\n# ngre-temporary (removed automatically)\nexit 101\n' > "$POLICY_RC" 2>/dev/null || return 1
+    chmod +x "$POLICY_RC"
+}
+
 ensure_nginx() {
     detect_pkg_mgr
     if ! command -v nginx >/dev/null 2>&1; then
         info "Installing nginx (only the first time; usually 1-3 minutes, Ctrl+C cancels) ..."
         local policy_created=0 rc
-        # keep apt from auto-starting the system nginx (it could fight over port 80)
-        if [[ "$PKG_MGR" == "apt" && ! -e /usr/sbin/policy-rc.d ]]; then
-            printf '#!/bin/sh\n# ngre-temporary (removed automatically)\nexit 101\n' > /usr/sbin/policy-rc.d
-            chmod +x /usr/sbin/policy-rc.d
-            policy_created=1
-        fi
+        policy_rc_block && policy_created=1
         case "$PKG_MGR" in
             apt)     pkg_install nginx libnginx-mod-stream; rc=$?
                      (( rc != 0 && rc != 130 && rc != 124 )) && { pkg_install nginx; rc=$?; } ;;
@@ -1165,7 +1190,7 @@ ensure_nginx() {
                      (( rc != 0 && rc != 130 )) && { pkg_install nginx; rc=$?; } ;;
             *)       rc=1 ;;
         esac
-        (( policy_created )) && rm -f /usr/sbin/policy-rc.d
+        (( policy_created )) && rm -f "$POLICY_RC"
         if (( rc == 130 )); then
             warn "Canceled - nothing was changed."
             return 1
@@ -2061,22 +2086,22 @@ reconcile_state() {
 
 startup_repair() {
     local out
-    # a crash during "apt install nginx" must never leave our temporary policy-rc.d behind
-    if [[ -f /usr/sbin/policy-rc.d ]] && grep -q 'ngre-temporary' /usr/sbin/policy-rc.d 2>/dev/null; then
-        # nginx got installed while our block was in place (the install was cut
-        # off before Ngre could switch the system nginx off): do that now, so it
-        # does not start on port 80 at the next boot
-        local dl
-        for dl in /var/lib/dpkg/info/nginx-common.list /var/lib/dpkg/info/nginx.list; do
-            if [[ -f "$dl" && "$dl" -nt /usr/sbin/policy-rc.d ]] && ! systemctl is-active --quiet nginx 2>/dev/null \
-               && systemctl is-enabled --quiet nginx 2>/dev/null; then
-                systemctl disable nginx >/dev/null 2>&1
-                log WARN "Repair: system nginx.service (installed by an interrupted Ngre setup) disabled"
-                break
+    # a crash during "apt install nginx/iperf3" must never leave our temporary policy-rc.d behind
+    if [[ -f "$POLICY_RC" ]] && grep -q 'ngre-temporary' "$POLICY_RC" 2>/dev/null; then
+        # a package got installed while our block was in place (the install was
+        # cut off before Ngre could switch its service off): do that now, so it
+        # does not start at the next boot (nginx: port 80, iperf3: open to all)
+        local dl svc
+        for dl in /var/lib/dpkg/info/nginx-common.list /var/lib/dpkg/info/nginx.list /var/lib/dpkg/info/iperf3.list; do
+            svc=nginx; [[ "$dl" == */iperf3.list ]] && svc=iperf3
+            if [[ -f "$dl" && "$dl" -nt "$POLICY_RC" ]] && ! systemctl is-active --quiet "$svc" 2>/dev/null \
+               && systemctl is-enabled --quiet "$svc" 2>/dev/null; then
+                systemctl disable "$svc" >/dev/null 2>&1
+                log WARN "Repair: system ${svc}.service (installed by an interrupted Ngre setup) disabled"
             fi
         done
-        rm -f /usr/sbin/policy-rc.d
-        log WARN "Repair: removed leftover temporary /usr/sbin/policy-rc.d"
+        rm -f "$POLICY_RC"
+        log WARN "Repair: removed leftover temporary $POLICY_RC"
     fi
     clean_stale_tmp
     [[ -d "$TUN_DIR" ]] || return 0
@@ -2185,6 +2210,7 @@ display_menu() {
     echo -e " 7. View logs"
     echo -e " 8. Update script"
     echo -e " 9. Uninstall Ngre"
+    echo -e "10. Network optimization (TCP speed)$(opt_tag)"
     echo -e " 0. Exit"
     echo
     echo "-------------------------------"
@@ -2630,6 +2656,7 @@ tunnel_actions() {
         echo " 7) Test this tunnel"
         echo " 8) View details"
         echo " 9) View service logs"
+        echo "10) Speed test (iperf3)"
         echo
         echo -ne "Enter your choice (0 to return): "; ask c || return
         case "$c" in
@@ -2642,6 +2669,7 @@ tunnel_actions() {
             7) test_tunnel ;;
             8) tunnel_details ;;
             9) tunnel_logs ;;
+            10) speed_test_menu ;;
             0|"") return ;;
             *) echo -e "${RED}Invalid option!${NC}" && sleep 1 ;;
         esac
@@ -3015,6 +3043,409 @@ tunnel_logs() {
 }
 
 # ============================================================================
+#  Speed test through a tunnel (tunnel menu 10, iperf3)
+#   One server waits (iperf3 server bound to its TUNNEL IP: reachable only
+#   through this tunnel, never from the internet), the other runs the test.
+#   The two Ngre copies cannot talk to each other, so the user starts both.
+# ============================================================================
+ensure_iperf3() {
+    command -v "$IPERF3_BIN" >/dev/null 2>&1 && return 0
+    detect_pkg_mgr
+    if [[ -z "$PKG_MGR" ]]; then
+        fail "iperf3 is not installed and no package manager (apt/dnf/yum) was found."
+        echo "      Install iperf3 by hand."
+        return 1
+    fi
+    info "Installing iperf3 (only the first time; Ctrl+C cancels) ..."
+    local rc policy_created=0
+    policy_rc_block && policy_created=1
+    pkg_install iperf3; rc=$?
+    (( policy_created )) && rm -f "$POLICY_RC"
+    if (( rc == 130 )); then warn "Canceled - nothing was changed."; return 1; fi
+    if ! command -v "$IPERF3_BIN" >/dev/null 2>&1; then
+        fail "iperf3 could not be installed."
+        [[ -n "$PKG_ERROR" ]] && echo "$PKG_ERROR" | sed 's/^/      /'
+        echo "      Check the server's internet / package mirror, then install it by hand:"
+        echo "        apt install iperf3"
+        return 1
+    fi
+    # some packages switch on an iperf3 service for the whole internet: Ngre only needs the program
+    if systemctl is-enabled --quiet iperf3 2>/dev/null || systemctl is-active --quiet iperf3 2>/dev/null; then
+        unit_disable_stop iperf3
+        info "The iperf3 system service that came with the package was switched off"
+        echo "      (it would be open to the whole internet; Ngre only needs the program)."
+    fi
+    ok "iperf3 installed"
+    log INFO "iperf3 installed for the speed test"
+    return 0
+}
+
+# "ADDRESS PID NAME" of every TCP listener on port $1 (this server only)
+port_listeners() {
+    ssq -ltnp 2>/dev/null | awk -v p=":$1" '
+        { a = $4
+          if (length(a) <= length(p) || substr(a, length(a) - length(p) + 1) != p) next
+          pid = "-"; name = "?"
+          if (match($0, /users:\(\("[^"]*",pid=[0-9]+/)) {
+              s = substr($0, RSTART + 9, RLENGTH - 9); split(s, x, "\",pid="); name = x[1]; pid = x[2]
+          }
+          print a, pid, name }'
+}
+
+# does listener address $1 accept connections to our tunnel IP on the test port?
+iperf_covers_us() {
+    case "$1" in
+        "*:$IPERF_PORT"|"0.0.0.0:$IPERF_PORT"|"[::]:$IPERF_PORT"|"${T_LOCAL_TUN_IP}:$IPERF_PORT"|"[::ffff:${T_LOCAL_TUN_IP}]:$IPERF_PORT") return 0 ;;
+    esac
+    return 1
+}
+
+# stop process $1 and its children (a test server: "timeout" + iperf3)
+iperf_kill() {
+    local pid="$1" i
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+    pkill -TERM -P "$pid" 2>/dev/null
+    kill -TERM "$pid" 2>/dev/null
+    for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$pid" 2>/dev/null || return 0; sleep 0.1; done
+    pkill -KILL -P "$pid" 2>/dev/null
+    kill -KILL "$pid" 2>/dev/null
+    return 0
+}
+
+# remove pid file $1 only while it still names OUR server $2 (a second Ngre
+# session may have replaced our server and written its own pid meanwhile)
+iperf_forget_pidfile() {
+    [[ "$(cat "$1" 2>/dev/null)" == "$2" ]] && rm -f "$1"
+    return 0
+}
+
+# stop the test server recorded in pid file $1 (only if it really is ours)
+iperf_stop_pidfile() {
+    local pf="$1" pid
+    pid="$(cat "$pf" 2>/dev/null)"
+    if [[ "$pid" =~ ^[0-9]+$ ]] && tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q 'iperf3'; then
+        iperf_kill "$pid"
+    fi
+    rm -f "$pf"
+}
+
+speed_wait_txt() {
+    if (( IPERF_WAIT_MAX >= 60 )); then echo "$(( IPERF_WAIT_MAX / 60 )) minutes"; else echo "${IPERF_WAIT_MAX} seconds"; fi
+}
+
+speed_other_role() { if [[ "$T_ROLE" == "iran" ]]; then echo KHAREJ; else echo IRAN; fi; }
+
+# down = other server -> this one, up = this -> other
+speed_dir_label() {
+    local this="${T_ROLE^^}" other from to what="users upload"
+    other="$(speed_other_role)"
+    if [[ "$1" == "down" ]]; then from="$other"; to="$this"; else from="$this"; to="$other"; fi
+    [[ "$from" == "KHAREJ" ]] && what="users download"
+    echo "$from -> $to ($what)"
+}
+
+speed_test_menu() {
+    local c
+    while true; do
+        load_tunnel "$T_CONF" || return
+        cls
+        colorize cyan "Speed test through tunnel ${T_NAME}  (iperf3)" bold
+        echo
+        echo -e "  This server:   ${T_ROLE^^}  ${T_LOCAL_IP}   (tunnel IP ${T_LOCAL_TUN_IP})"
+        echo -e "  Other server:  $(speed_other_role)  ${T_REMOTE_IP}   (tunnel IP ${T_REMOTE_TUN_IP})"
+        echo
+        echo "  Measures the real speed between the two servers through this tunnel."
+        echo "    Step 1: on the other server choose  2) Wait for a test"
+        echo "    Step 2: here choose  1) Run the test        (or the other way round)"
+        echo
+        echo " 1) Run the test (the other server must be waiting)"
+        echo " 2) Wait for a test from the other server"
+        echo
+        echo -ne "Enter your choice (0 to return): "; ask c || return
+        case "$c" in
+            1) speed_client ;;
+            2) speed_server ;;
+            0|"") return ;;
+            *) echo -e "${RED}Invalid option!${NC}" && sleep 1 ;;
+        esac
+    done
+}
+
+# ---- waiting side -----------------------------------------------------------
+speed_server() {
+    echo
+    if ! iface_up "$T_IFACE"; then
+        fail "Interface ${T_IFACE} is down - start or restart this tunnel first."; press_key; return
+    fi
+    ensure_iperf3 || { press_key; return; }
+    local pf d lg pid="" own=0 addr lpid lname n shown=-1 t0 el stop=0 i err rc entry
+    local -a extra=() listeners=()
+    pf="$IPERF_RUN_DIR/ngre-iperf-${T_NAME}.pid"
+    iperf_stop_pidfile "$pf"          # an earlier test server of this tunnel: always start fresh
+    # something else on the test port?  (read into an array first: the questions
+    # below must read the keyboard, not the output of port_listeners)
+    mapfile -t listeners < <(port_listeners "$IPERF_PORT")
+    for entry in "${listeners[@]}"; do
+        read -r addr lpid lname <<<"$entry"
+        iperf_covers_us "$addr" || continue
+        if [[ "$lname" != "iperf3" ]]; then
+            if [[ "$lname" == "?" ]]; then
+                fail "Port ${IPERF_PORT} of this server is used by another program (not visible from here)."
+            else
+                fail "Port ${IPERF_PORT} of this server is used by another program: ${lname} (pid ${lpid})."
+            fi
+            echo "      Do it the other way round: choose 'Wait for a test' on ${T_REMOTE_IP} and"
+            echo "      'Run the test' here - both directions are measured either way."
+            press_key; return
+        fi
+        if [[ "$addr" == "${T_LOCAL_TUN_IP}:$IPERF_PORT" ]]; then
+            warn "An iperf3 test server started by hand runs on this tunnel (pid ${lpid})."
+            confirm "Replace it with a fresh one? (an old one can hang)" Y && iperf_kill "$lpid"
+        else
+            warn "An iperf3 server (pid ${lpid}) listens on ALL addresses of this server,"
+            echo "      also the public IP: anyone on the internet can run speed tests"
+            echo "      against it and use up your traffic quota."
+            if confirm "Stop it (recommended)?" Y; then
+                if systemctl is-enabled --quiet iperf3 2>/dev/null || systemctl is-active --quiet iperf3 2>/dev/null; then
+                    unit_disable_stop iperf3
+                    log INFO "Speed test: switched off the public iperf3 service"
+                fi
+                iperf_kill "$lpid"
+            fi
+        fi
+    done
+    sleep 0.2
+    d="$(make_tmpdir)"; lg="$d/server.log"
+    while read -r addr lpid lname; do
+        iperf_covers_us "$addr" && [[ "$lname" == "iperf3" ]] && { pid="$lpid"; break; }
+    done < <(port_listeners "$IPERF_PORT")
+    # from here on a Ctrl+C / hangup must still stop our test server
+    trap 'stop=1' INT
+    trap 'stop=2' HUP TERM
+    if [[ -n "$pid" ]]; then
+        info "Using the iperf3 server that is already running (pid ${pid})."
+    else
+        "$IPERF3_BIN" --help 2>&1 | grep -q -- '--idle-timeout' && extra=(--idle-timeout 60)
+        timeout "$IPERF_WAIT_MAX" "$IPERF3_BIN" -s -B "$T_LOCAL_TUN_IP" -p "$IPERF_PORT" "${extra[@]}" \
+            > "$lg" 2>&1 < /dev/null 7>&- 8>&- 9>&- &
+        pid=$!; own=1
+        echo "$pid" > "$pf"
+        for i in $(seq 1 30); do
+            port_listeners "$IPERF_PORT" | grep -q "^${T_LOCAL_TUN_IP//./\\.}:${IPERF_PORT} " && break
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.1
+        done
+        if ! kill -0 "$pid" 2>/dev/null; then
+            wait "$pid" 2>/dev/null
+            err="$(grep -m1 -i 'error' "$lg" | safe_text)"
+            fail "The test server could not start: ${err:-unknown error}"
+            case "$err" in
+                *"assign requested address"*)
+                    echo "      The tunnel IP ${T_LOCAL_TUN_IP} is not on this server right now -"
+                    echo "      restart this tunnel." ;;
+                *"already in use"*) echo "      Another program took port ${IPERF_PORT} - see:  ss -ltnp | grep ${IPERF_PORT}" ;;
+            esac
+            iperf_forget_pidfile "$pf" "$pid"; rm -rf "${d:?}"
+            trap - INT HUP TERM
+            (( stop == 2 )) && exit 0
+            press_key; return
+        fi
+    fi
+    ok "Test server is waiting on ${T_LOCAL_TUN_IP}:${IPERF_PORT} (only through this tunnel)"
+    echo
+    echo -e "  Now on the other server (${YELLOW}${T_REMOTE_IP}${NC}) open:"
+    echo -e "      ${CYAN}ngre -> 2 -> tunnel ${T_TUNNEL_PORT} -> 10) Speed test -> 1) Run the test${NC}"
+    echo "  Press Enter here when done (stops by itself after $(speed_wait_txt))."
+    echo
+    t0=$(mono_s)
+    while (( stop == 0 )); do
+        n=0
+        (( own )) && n="$(grep -c 'Accepted connection from' "$lg" 2>/dev/null)"
+        el=$(( $(mono_s) - t0 ))
+        if (( own )) && ! kill -0 "$pid" 2>/dev/null; then
+            echo
+            if (( el >= IPERF_WAIT_MAX - 2 )); then info "The test server stopped by itself after $(speed_wait_txt)."
+            else warn "The test server was stopped from outside."
+            fi
+            break
+        fi
+        if [[ -t 1 ]]; then
+            printf '\r  Waiting ... %s   tests done: %s\033[K' "$(fmt_elapsed "$el")" "$n"
+        elif [[ "$n" != "$shown" ]]; then
+            echo "  Waiting ... tests done: $n   (Enter = stop)"
+        fi
+        shown="$n"
+        IFS= read -r -t 1 _; rc=$?
+        (( rc == 0 || rc == 1 )) && break         # Enter / input closed
+    done
+    trap - INT HUP TERM
+    [[ -t 1 ]] && echo
+    if (( own )); then
+        iperf_kill "$pid"; wait "$pid" 2>/dev/null
+        iperf_forget_pidfile "$pf" "$pid"
+        n="$(grep -c 'Accepted connection from' "$lg" 2>/dev/null)"
+        ok "Test server stopped (${n} test(s) done)."
+        log INFO "Speed test ${T_NAME}: test server served ${n} test(s)"
+    fi
+    rm -rf "${d:?}"
+    (( stop == 2 )) && exit 0
+    press_key
+}
+
+# ---- testing side -----------------------------------------------------------
+# JSON result of iperf3 -J  ->  "bits_per_second|retransmits|error"
+speed_parse() {
+    awk '
+        /"error"[[:space:]]*:/ && err == "" {
+            e = $0; sub(/.*"error"[[:space:]]*:[[:space:]]*"/, "", e); sub(/"[[:space:]]*,?[[:space:]]*$/, "", e); err = e }
+        /iperf3: error - / && err == "" { e = $0; sub(/.*iperf3: error - /, "", e); err = e }
+        /^[[:space:]]*"end"[[:space:]]*:[[:space:]]*\{/ { inend = 1 }
+        inend && /"sum_sent"[[:space:]]*:/ { cur = "s" }
+        inend && /"sum_received"[[:space:]]*:/ { cur = "r" }
+        inend && /"(streams|cpu_utilization_percent)"[[:space:]]*:/ { cur = "" }
+        inend && cur == "s" && /"retransmits"[[:space:]]*:/ && retr == "" { v = $0; gsub(/[^0-9]/, "", v); retr = v }
+        inend && cur == "r" && /"bits_per_second"[[:space:]]*:/ && bps == "" {
+            v = $0; sub(/.*:[[:space:]]*/, "", v); sub(/[,[:space:]].*$/, "", v); bps = v }
+        END { printf "%s|%s|%s\n", bps, retr, err }' "$1" | tr -d '\000-\010\013-\037\177'
+}
+
+# plain-language reason for a failed test run
+speed_reason() {
+    local e="$1" rc="$2"
+    if (( rc == 124 )); then
+        echo "The test did not finish in time: the tunnel or the other server"
+        echo "  stopped answering during the test."; return
+    fi
+    case "$e" in
+        *"busy"*) echo "The test server on the other server is busy with another test."
+                  echo "  Try again in a moment." ;;
+        *"refused"*)
+            echo "No test server is waiting on ${T_REMOTE_IP}. On that server open"
+            echo "  (needs Ngre v1.4.0 or newer there):"
+            echo "  ngre -> 2 -> tunnel ${T_TUNNEL_PORT} -> 10) Speed test -> 2) Wait for a test" ;;
+        *"timed out"*|*"No route"*|*"unreachable"*|*"connect to server"*)
+            echo "${T_REMOTE_IP} does not answer through the tunnel on port ${IPERF_PORT}:"
+            echo "  the tunnel is down, or a firewall on that server blocks it"
+            echo "  (Ngre's own firewall rules allow it)." ;;
+        *"closed unexpectedly"*|*"control message"*|*"reset"*|*"unable to read"*|*"unable to send"*|*"unable to receive"*)
+            echo "The connection broke during the test: the tunnel dropped, or the"
+            echo "  test server on the other side was stopped." ;;
+        canceled) echo "Canceled." ;;
+        "") echo "The test gave no result (iperf3 exit code ${rc})." ;;
+        *) echo "iperf3: ${e}" ;;
+    esac
+}
+
+# speed_run down|up STREAMS  -> SR_MBPS SR_RETR SR_ERR SR_RC ; 0 = success
+speed_run() {
+    local -a rev=()
+    local of pid t0 bps try
+    [[ "$1" == "down" ]] && rev=(-R)
+    of="$SPEED_TMP/run.json"
+    for try in 1 2 3; do
+        : > "$of"
+        timeout $(( IPERF_SECONDS + 35 )) "$IPERF3_BIN" -c "$T_REMOTE_TUN_IP" -p "$IPERF_PORT" -t "$IPERF_SECONDS" -O 1 \
+            -P "$2" "${rev[@]}" -J "${SPEED_CT[@]}" > "$of" 2>&1 < /dev/null 7>&- 8>&- 9>&- &
+        pid=$!
+        t0=$(mono_s)
+        while kill -0 "$pid" 2>/dev/null; do
+            (( SPEED_STOP )) && iperf_kill "$pid"
+            [[ -t 1 ]] && printf '\r      running ... %2d s\033[K' $(( $(mono_s) - t0 ))
+            sleep 0.3
+        done
+        wait "$pid"; SR_RC=$?
+        [[ -t 1 ]] && printf '\r\033[K'
+        IFS='|' read -r bps SR_RETR SR_ERR <<<"$(speed_parse "$of")"
+        (( SPEED_STOP )) && { SR_ERR="canceled"; SR_MBPS=""; return 1; }
+        # the other side still finishing the previous test: wait a little
+        [[ "$SR_ERR" == *busy* && $try -lt 3 ]] && { sleep 3; continue; }
+        break
+    done
+    SR_MBPS=""
+    [[ "$bps" =~ ^[0-9.eE+-]+$ ]] && SR_MBPS="$(awk -v b="$bps" 'BEGIN { printf "%d", b / 1000000 + 0.5 }')"
+    [[ -n "$SR_MBPS" && -z "$SR_ERR" && "$SR_RC" == 0 ]]
+}
+
+speed_client() {
+    echo
+    if ! iface_up "$T_IFACE"; then
+        fail "Interface ${T_IFACE} is down - start or restart this tunnel first."; press_key; return
+    fi
+    ensure_iperf3 || { press_key; return; }
+    local c gb dir s ok_all=1 summary="" single="" multi="" line_txt mbs
+    local -a streams=() res=()
+    echo "  1) Quick: total capacity (8 connections), both directions   ~15 s"
+    echo "  2) One connection (the speed one user gets), both directions ~15 s"
+    echo "  3) Full: both of the above                                  ~30 s"
+    echo -ne "Choose [1-3, Enter = 1]: "; ask c || return
+    case "${c:-1}" in
+        1) streams=(8) ;;
+        2) streams=(1) ;;
+        3) streams=(1 8) ;;
+        *) echo -e "${RED}Invalid option!${NC}"; sleep 1; return ;;
+    esac
+    # at 1 Gbit/s one direction moves about 125 MB per second
+    gb="$(awk -v n=$(( ${#streams[@]} * 2 )) -v s=$(( IPERF_SECONDS + 1 )) 'BEGIN { printf "%.1f", n * s * 0.125 }')"
+    warn "The test sends real data: up to about ${gb} GB at 1 Gbit/s,"
+    echo "      counted on the traffic quota of BOTH servers."
+    confirm "Start the speed test?" Y || return
+    SPEED_CT=()
+    "$IPERF3_BIN" --help 2>&1 | grep -q -- '--connect-timeout' && SPEED_CT=(--connect-timeout 5000)
+    SPEED_TMP="$(make_tmpdir)"; SPEED_STOP=0; SPEED_HUP=0
+    trap 'SPEED_STOP=1' INT
+    trap 'SPEED_STOP=1; SPEED_HUP=1' HUP TERM
+    echo
+    for s in "${streams[@]}"; do
+        for dir in down up; do
+            (( SPEED_STOP )) && break 2
+            if (( s == 1 )); then c="1 connection"; else c="$s connections"; fi
+            echo -e "  ${CYAN}•${NC} $(speed_dir_label "$dir"), ${c} ..."
+            if speed_run "$dir" "$s"; then
+                mbs="$(awk -v m="$SR_MBPS" 'BEGIN { printf "%.0f", m / 8 }')"
+                line_txt="$(printf '%-33s %5s %10s %8s %13s' "$(speed_dir_label "$dir")" "$s" "$SR_MBPS" "$mbs" "${SR_RETR:--}")"
+                res+=("$line_txt")
+                summary+="$(speed_dir_label "$dir" | cut -d' ' -f1-3) x${s}: ${SR_MBPS} Mbit/s; "
+                if [[ "$dir" == "down" ]]; then
+                    (( s == 1 )) && single="$SR_MBPS"
+                    (( s > 1 )) && multi="$SR_MBPS"
+                fi
+            elif [[ "$SR_ERR" == canceled ]]; then
+                warn "Canceled."
+                break 2
+            else
+                ok_all=0
+                fail "Test failed:"
+                speed_reason "$SR_ERR" "$SR_RC" | sed 's/^/      /'
+                break 2
+            fi
+        done
+    done
+    trap - INT HUP TERM
+    rm -rf "${SPEED_TMP:?}"
+    (( SPEED_HUP )) && exit 0
+    if (( ${#res[@]} > 0 )); then
+        echo
+        colorize cyan "  Results through tunnel ${T_NAME}:" bold
+        printf '  %-33s %5s %10s %8s %13s\n' "Direction" "Conn." "Mbit/s" "MB/s" "Retransmits"
+        printf '  %s\n' "${res[@]}"
+        log INFO "Speed test ${T_NAME}: ${summary%; }"
+        if [[ "$(opt_state)" == off || "$(opt_state)" == partly ]]; then
+            if [[ -n "$single" && -n "$multi" ]] && (( single * 2 < multi )); then
+                echo
+                info "One connection is much slower than 8 together."
+                echo "      Fix: network optimization (main menu -> 10) on BOTH servers."
+            elif [[ -n "$single" ]]; then
+                echo
+                info "Tip: network optimization (main menu -> 10) on BOTH servers makes"
+                echo "      one connection faster."
+            fi
+        fi
+    fi
+    (( ok_all == 0 )) && log WARN "Speed test ${T_NAME} failed: ${SR_ERR:-exit ${SR_RC}}"
+    press_key
+}
+
+# ============================================================================
 #  3) Status
 # ============================================================================
 check_tunnel_status() {
@@ -3118,13 +3549,401 @@ view_logs() {
 }
 
 # ============================================================================
+#  10) Network optimization (TCP speed)
+#   Bigger TCP buffers + BBR. On a long path (IRAN <-> KHAREJ, ~100 ms) one TCP
+#   connection is limited to about buffer / round-trip time; the default
+#   buffers cap it near 200 Mbit/s. Values are only ever raised, never lowered,
+#   and everything is undone by "Remove" (or by uninstalling Ngre).
+#   Settings are read and written in /proc/sys directly: works without the
+#   sysctl program and shows which keys a container VPS does not allow.
+# ============================================================================
+# (pure bash, no extra processes: the main menu reads these on every redraw)
+sc_path() { echo "$PROC_SYS/${1//.//}"; }
+sc_norm() {
+    local -a w
+    read -ra w <<<"${1//$'\r'/ }"
+    printf '%s' "${w[*]}"
+}
+# sc_read KEY VAR : whitespace-normalised value of KEY into variable VAR
+sc_read() {
+    local __v
+    local -a __w
+    { IFS= read -r __v < "$PROC_SYS/${1//.//}"; } 2>/dev/null || return 1
+    read -ra __w <<<"${__v//$'\r'/ }"
+    printf -v "$2" '%s' "${__w[*]}"
+}
+sc_get() {
+    local v
+    sc_read "$1" v || return 1
+    printf '%s\n' "$v"
+}
+# sc_set KEY VALUE -> 0 when the kernel really took the value
+sc_set() {
+    local p; p="$(sc_path "$1")"
+    [[ -e "$p" ]] || return 2
+    { printf '%s\n' "$2" > "$p"; } 2>/dev/null || return 1
+    [[ "$(sc_get "$1")" == "$(sc_norm "$2")" ]]
+}
+# key exists and is not read-only (no write: for status screens)
+sc_changeable() { [[ -e "$PROC_SYS/${1//.//}" && -w "$PROC_SYS/${1//.//}" ]]; }
+opt_label() {
+    case "$1" in
+        net.core.rmem_max) echo "Socket receive limit" ;;
+        net.core.wmem_max) echo "Socket send limit" ;;
+        net.ipv4.tcp_rmem) echo "TCP receive buffer (max)" ;;
+        net.ipv4.tcp_wmem) echo "TCP send buffer (max)" ;;
+        net.ipv4.tcp_congestion_control) echo "Congestion control" ;;
+        net.core.default_qdisc) echo "Queue discipline" ;;
+    esac
+}
+
+# 16 MB buffers (8 MB on servers with less than ~1 GB RAM)
+opt_buf_size() {
+    local k v _
+    if [[ -r "$MEMINFO" ]]; then
+        while read -r k v _; do
+            if [[ "$k" == MemTotal: ]]; then
+                if is_uint "$v" && (( v < 900000 )); then echo 8388608; return; fi
+                break
+            fi
+        done < "$MEMINFO"
+    fi
+    echo 16777216
+}
+
+# opt_target_into KEY CURRENT BUF VAR -> recommended value into VAR (a higher
+# value is kept; no extra process)
+opt_target_into() {
+    local __a __b __c __t
+    case "$1" in
+        net.core.rmem_max|net.core.wmem_max)
+            if is_uint "$2" && (( $2 > $3 )); then __t="$2"; else __t="$3"; fi ;;
+        net.ipv4.tcp_rmem|net.ipv4.tcp_wmem)
+            read -r __a __b __c <<<"$2"
+            is_uint "$__a" && is_uint "$__b" && is_uint "$__c" || return 1
+            (( __c < $3 )) && __c="$3"
+            __t="$__a $__b $__c" ;;
+        net.ipv4.tcp_congestion_control) __t=bbr ;;
+        net.core.default_qdisc) __t=fq ;;
+        *) return 1 ;;
+    esac
+    printf -v "$4" '%s' "$__t"
+}
+opt_target() {
+    local t
+    opt_target_into "$1" "$2" "$3" t || return 1
+    echo "$t"
+}
+
+# does CURRENT already meet TARGET? (buffers: at least as big)
+opt_meets() {
+    local k="$1" cur="$2" tgt="$3" c1 c2
+    case "$k" in
+        net.core.rmem_max|net.core.wmem_max) is_uint "$cur" && is_uint "$tgt" && (( cur >= tgt )) ;;
+        net.ipv4.tcp_rmem|net.ipv4.tcp_wmem)
+            c1="${cur##* }"; c2="${tgt##* }"
+            is_uint "$c1" && is_uint "$c2" && (( c1 >= c2 )) ;;
+        *) [[ "$cur" == "$tgt" ]] ;;
+    esac
+}
+
+# human readable value
+opt_show_val() {
+    local k="$1" v="$2"
+    case "$k" in
+        net.core.rmem_max|net.core.wmem_max|net.ipv4.tcp_rmem|net.ipv4.tcp_wmem)
+            v="${v##* }"
+            is_uint "$v" && awk -v b="$v" 'BEGIN { m = b / 1048576; if (m == int(m)) printf "%d MB", m; else printf "%.1f MB", m }' \
+                || echo "$v" ;;
+        *) echo "$v" ;;
+    esac
+}
+
+bbr_listed() { [[ " $(sc_get net.ipv4.tcp_available_congestion_control) " == *" bbr "* ]]; }
+# Apply found that KEY cannot be set on this server: prints the reason
+# (kept in Ngre's file as "# skip: KEY - reason")
+opt_skip_reason() {
+    local l p="# skip: $1 - "
+    [[ -f "$OPT_FILE" ]] || return 1
+    while IFS= read -r l; do
+        [[ "$l" == "$p"* ]] && { echo "${l#"$p"}"; return 0; }
+    done < "$OPT_FILE"
+    return 1
+}
+
+# on       every setting this server allows is at the recommended value
+# partly   Ngre applied it, but some value was changed afterwards
+# off      not applied
+# none     this server allows none of these settings (container VPS)
+opt_state() {
+    local k cur tgt buf n=0 bad=0 l skips=""
+    buf="$(opt_buf_size)"
+    if [[ -f "$OPT_FILE" ]]; then
+        while IFS= read -r l; do [[ "$l" == "# skip: "* ]] && skips+=" ${l#"# skip: "}"; done < "$OPT_FILE"
+    fi
+    for k in "${OPT_KEYS[@]}"; do
+        sc_read "$k" cur || continue                          # not available here (container)
+        sc_changeable "$k" || continue                        # read-only here (container)
+        [[ "$skips" == *" $k - "* ]] && continue              # Apply found it cannot be set
+        opt_target_into "$k" "$cur" "$buf" tgt || continue
+        n=$((n + 1))
+        opt_meets "$k" "$cur" "$tgt" || bad=$((bad + 1))
+    done
+    if (( n == 0 )); then echo none
+    elif (( bad == 0 )); then echo on
+    elif [[ -f "$OPT_FILE" ]]; then echo partly
+    else echo off
+    fi
+}
+opt_all_ok() { [[ "$(opt_state)" == on ]]; }
+
+# tag for the main menu
+opt_tag() {
+    case "$(opt_state)" in
+        on)     echo -e " ${GREEN}[on]${NC}" ;;
+        partly) echo -e " ${YELLOW}[partly]${NC}" ;;
+    esac
+}
+
+opt_show() {
+    local k cur tgt buf mark why
+    buf="$(opt_buf_size)"
+    printf '  %-26s %-12s %-12s\n' "Setting" "Now" "Recommended"
+    for k in "${OPT_KEYS[@]}"; do
+        if ! cur="$(sc_get "$k")"; then
+            printf '  %-26s %-12s %s\n' "$(opt_label "$k")" "-" "(not available on this server)"
+            continue
+        fi
+        if ! sc_changeable "$k"; then
+            printf '  %-26s %-12s %s\n' "$(opt_label "$k")" "$(opt_show_val "$k" "$cur")" "(cannot be changed on this server)"
+            continue
+        fi
+        if why="$(opt_skip_reason "$k")"; then
+            printf '  %-26s %-12s %s\n' "$(opt_label "$k")" "$(opt_show_val "$k" "$cur")" "($why)"
+            continue
+        fi
+        tgt="$(opt_target "$k" "$cur" "$buf")"
+        if opt_meets "$k" "$cur" "$tgt"; then mark="${GREEN}✔${NC}"; else mark="${RED}✖${NC}"; fi
+        printf '  %-26s %-12s %-12s' "$(opt_label "$k")" "$(opt_show_val "$k" "$cur")" "$(opt_show_val "$k" "$tgt")"
+        echo -e " $mark"
+    done
+    echo
+    case "$(opt_state)" in
+        none)   warn "This server does not allow changing these settings (container-type VPS)." ;;
+        on)     if [[ -f "$OPT_FILE" ]]; then ok "Applied by Ngre (kept after reboot: ${OPT_FILE})"
+                else ok "Already optimized (by other settings on this server)"
+                fi ;;
+        partly) warn "Applied by Ngre, but some values were changed afterwards by another"
+                echo "      program or setting - apply again." ;;
+        *)      info "Not applied" ;;
+    esac
+}
+
+# lines "file: key = value" of other sysctl files that would put a different
+# value over ours (/etc/sysctl.conf is re-read by "sysctl -p" / "sysctl --system")
+opt_conflicts() {
+    local f base ours k v line
+    ours="${OPT_FILE##*/}"
+    for f in "$SYSCTL_CONF" "$SYSCTL_D"/*.conf /run/sysctl.d/*.conf /usr/local/lib/sysctl.d/*.conf /usr/lib/sysctl.d/*.conf; do
+        [[ -f "$f" && "$f" != "$OPT_FILE" ]] || continue
+        base="${f##*/}"
+        [[ "$f" == "$SYSCTL_CONF" || "$base" > "$ours" ]] || continue
+        while IFS= read -r line; do
+            line="${line%%#*}"; line="${line%%;*}"
+            [[ "$line" == *=* ]] || continue
+            k="$(sc_norm "${line%%=*}")"; k="${k#-}"; k="${k//\//.}"
+            v="$(sc_norm "${line#*=}")"
+            grep -qxF -- "$k = $v" "$OPT_FILE" 2>/dev/null && continue
+            grep -q -- "^${k//./\\.} = " "$OPT_FILE" 2>/dev/null || continue
+            echo "$f: $k = $v"
+        done < "$f"
+    done
+}
+
+opt_menu() {
+    local c
+    while true; do
+        cls
+        colorize cyan "Network optimization (TCP speed)" bold
+        line
+        echo "  Bigger TCP buffers + BBR congestion control: one connection through a long"
+        echo "  tunnel gets much faster (measured IRAN-KHAREJ, 96 ms: 212 -> 620 Mbit/s)."
+        echo "  Apply it on BOTH servers of your tunnels."
+        echo
+        opt_show
+        echo
+        echo " 1) Apply the optimization"
+        [[ -f "$OPT_FILE" ]] && echo " 2) Remove it (restore the previous values)"
+        echo
+        echo -ne "Enter your choice (0 to return): "; ask c || return
+        case "$c" in
+            1) opt_apply; press_key ;;
+            2) if [[ -f "$OPT_FILE" ]]; then opt_remove_menu; press_key; else echo -e "${RED}Invalid option!${NC}"; sleep 1; fi ;;
+            0|"") return ;;
+            *) echo -e "${RED}Invalid option!${NC}" && sleep 1 ;;
+        esac
+    done
+}
+
+opt_apply() {
+    echo
+    local k cur tgt buf done_n=0 bbr_ok=0 fq_ok=0 had_file=0 i s
+    local -a plan_k=() plan_v=() skipped=() marks=() applied=()
+    buf="$(opt_buf_size)"
+    critical_begin || return
+    [[ -f "$OPT_FILE" ]] && had_file=1
+    # 1) what can be set on this server, and to what
+    for k in "${OPT_KEYS[@]}"; do
+        if ! cur="$(sc_get "$k")" || ! sc_changeable "$k"; then
+            skipped+=("$(opt_label "$k"): cannot be changed on this server (container VPS)")
+            continue
+        fi
+        if ! tgt="$(opt_target "$k" "$cur" "$buf")"; then
+            skipped+=("$(opt_label "$k"): unexpected value '$cur' - left as it is"); continue
+        fi
+        if [[ "$k" == net.ipv4.tcp_congestion_control && "$cur" != "$tgt" ]]; then
+            bbr_listed || { command -v modprobe >/dev/null 2>&1 && modprobe tcp_bbr >/dev/null 2>&1; }
+            if ! bbr_listed; then
+                skipped+=("$(opt_label "$k"): BBR is not available in this kernel - left as '$cur'")
+                marks+=("# skip: $k - BBR is not available in this kernel")
+                continue
+            fi
+        fi
+        plan_k+=("$k"); plan_v+=("$tgt")
+    done
+    if (( ${#plan_k[@]} == 0 )); then
+        critical_end
+        fail "This server does not allow changing these settings."
+        printf '      %s\n' "${skipped[@]}"
+        echo "      (usually a container VPS such as OpenVZ/LXC - ask the provider,"
+        echo "      or use a KVM VPS)"
+        return
+    fi
+    # 2) remember the values from before (only the first time: a re-apply keeps them)
+    if (( ! had_file )); then
+        { echo "# Values before Ngre's network optimization ($(date '+%F %T')) - used by \"Remove\""
+          for k in "${OPT_KEYS[@]}"; do cur="$(sc_get "$k")" && echo "$k = $cur"; done
+        } | write_atomic "$OPT_BEFORE" 600
+    fi
+    # 3) the file first: an interrupted apply is finished at the next boot and a
+    #    second Apply still knows the values from before
+    mkdir -p "$SYSCTL_D"
+    for i in "${!plan_k[@]}"; do applied+=("${plan_k[$i]} = ${plan_v[$i]}"); done
+    opt_write_file "${marks[@]}" -- "${applied[@]}"
+    # 4) runtime values (effective for new connections right away)
+    applied=()
+    for i in "${!plan_k[@]}"; do
+        k="${plan_k[$i]}"; tgt="${plan_v[$i]}"; cur="$(sc_get "$k")"
+        if [[ "$cur" == "$tgt" ]] || sc_set "$k" "$tgt" \
+           || { [[ "$k" == net.core.default_qdisc ]] && command -v modprobe >/dev/null 2>&1 \
+                && modprobe sch_fq >/dev/null 2>&1 && sc_set "$k" "$tgt"; }; then
+            applied+=("$k = $tgt"); done_n=$((done_n + 1))
+            [[ "$k" == net.ipv4.tcp_congestion_control ]] && bbr_ok=1
+            [[ "$k" == net.core.default_qdisc && "$cur" != "$tgt" ]] && fq_ok=1
+            if [[ "$cur" == "$tgt" ]]; then ok "$(opt_label "$k"): $(opt_show_val "$k" "$tgt") (already)"
+            else ok "$(opt_label "$k"): $(opt_show_val "$k" "$cur") -> $(opt_show_val "$k" "$tgt")"
+            fi
+        else
+            marks+=("# skip: $k - the kernel does not accept '$tgt'")
+            fail "$(opt_label "$k"): the kernel did not accept '$tgt' (left as '$(opt_show_val "$k" "$cur")')"
+        fi
+    done
+    for s in "${skipped[@]}"; do warn "$s"; done
+    # 5) keep what worked after reboot
+    if (( done_n > 0 )); then
+        if opt_write_file "${marks[@]}" -- "${applied[@]}"; then
+            ok "Saved in ${OPT_FILE} - kept after reboot"
+        else
+            fail "Could not write ${OPT_FILE} - the values are active now but not after a reboot"
+        fi
+        if (( bbr_ok )); then
+            mkdir -p "${OPT_MOD_FILE%/*}"
+            { echo "# Ngre network optimization"; echo tcp_bbr
+              grep -qx 'net.core.default_qdisc = fq' "$OPT_FILE" 2>/dev/null && echo sch_fq
+            } | write_atomic "$OPT_MOD_FILE" 644
+        else
+            rm -f "$OPT_MOD_FILE"
+        fi
+        log INFO "Network optimization applied: ${applied[*]}"
+    elif (( had_file )); then
+        opt_write_file "${marks[@]}" --
+    else
+        rm -f "$OPT_FILE" "$OPT_MOD_FILE" "$OPT_BEFORE"
+    fi
+    critical_end
+    local cf; cf="$(opt_conflicts)"
+    if [[ -n "$cf" ]]; then
+        echo
+        warn "Other settings on this server set some of these keys differently:"
+        echo "$cf" | safe_text | sed 's/^/        /'
+        echo "      They win when someone runs 'sysctl -p' / 'sysctl --system' (e.g. other"
+        echo "      optimizer scripts). If the status here shows ✖ again later, apply again."
+    fi
+    if (( done_n > 0 )); then
+        echo
+        info "New connections use the new settings right away; open ones keep"
+        echo "      the old settings until they reconnect."
+        (( fq_ok )) && info "The queue discipline (fq) is fully active after the next reboot."
+        info "Apply it on the other server(s) of your tunnels too."
+    fi
+}
+
+# opt_write_file MARK... -- "key = value"...   (Ngre's sysctl file)
+opt_write_file() {
+    local -a m=()
+    while (( $# )) && [[ "$1" != "--" ]]; do m+=("$1"); shift; done
+    shift
+    { echo "# Ngre network optimization - managed by ngre (ngre -> 10 removes it)"
+      (( ${#m[@]} )) && printf '%s\n' "${m[@]}"
+      (( $# )) && printf '%s\n' "$@"
+    } | write_atomic "$OPT_FILE" 644
+}
+
+# opt_remove [quiet] : restore the values from before and remove Ngre's files
+opt_remove() {
+    local line k v bad=0 known kk
+    [[ -f "$OPT_FILE" || -f "$OPT_BEFORE" || -f "$OPT_MOD_FILE" ]] || return 1
+    if [[ -f "$OPT_BEFORE" ]]; then
+        while IFS= read -r line; do
+            [[ "$line" =~ ^([a-z0-9_.]+)\ =\ ([A-Za-z0-9_\ ]+)$ ]] || continue
+            k="${BASH_REMATCH[1]}"; v="${BASH_REMATCH[2]}"
+            known=0; for kk in "${OPT_KEYS[@]}"; do [[ "$kk" == "$k" ]] && known=1; done
+            (( known )) || continue
+            [[ "$(sc_get "$k")" == "$(sc_norm "$v")" ]] && continue
+            sc_set "$k" "$v" || bad=$((bad + 1))
+        done < "$OPT_BEFORE"
+    else
+        bad=1
+    fi
+    rm -f "$OPT_FILE" "$OPT_MOD_FILE" "$OPT_BEFORE"
+    log INFO "Network optimization removed (previous values restored: $([[ $bad == 0 ]] && echo yes || echo partly))"
+    [[ -z "$1" ]] && {
+        if (( bad == 0 )); then ok "Previous values restored and Ngre's settings file removed."
+        else warn "Ngre's settings file was removed; some previous values could not be"
+             echo "      restored now - they come back after a reboot."
+        fi
+    }
+    return 0
+}
+
+opt_remove_menu() {
+    echo
+    confirm "Remove Ngre's network optimization and restore the previous values?" N || return
+    critical_begin || return
+    opt_remove
+    critical_end
+    [[ "$(opt_state)" == on ]] && info "The values are still at the recommended level (set by other settings on this server)."
+}
+
+# ============================================================================
 #  9) Uninstall
 # ============================================================================
 uninstall_ngre() {
     cls
     colorize red "Uninstall Ngre" bold
     echo
-    echo "This removes ALL Ngre tunnels, services, firewall rules added by Ngre and its settings."
+    echo "This removes ALL Ngre tunnels, services, firewall rules added by Ngre and its settings"
+    echo "(also the network optimization, if applied: the previous values come back)."
     echo "The system nginx and /etc/nginx are not touched."
     echo "A backup of /etc/ngre is saved in /root before removal."
     echo
@@ -3156,6 +3975,9 @@ uninstall_ngre() {
         ok "Removed tunnel $n (its config was unreadable)"
     done
     for n in $(fw_tagged_names); do fw_purge_name "$n"; done
+    local pf
+    for pf in "$IPERF_RUN_DIR"/ngre-iperf-*.pid; do [[ -f "$pf" ]] && iperf_stop_pidfile "$pf"; done
+    opt_remove quiet && ok "Network optimization removed (previous values restored)"
     unit_disable_stop "$NGX_SERVICE" "$WD_SERVICE" "$TRAFFIC_UNIT.timer" "$TRAFFIC_UNIT.service"
     rm -f "$SERVICE_DIR/$NGX_SERVICE.service" "$SERVICE_DIR/$WD_SERVICE.service" \
           "$SERVICE_DIR/$TRAFFIC_UNIT.service" "$SERVICE_DIR/$TRAFFIC_UNIT.timer" \
@@ -3718,7 +4540,7 @@ main_menu() {
     while true; do
         display_menu
         local choice
-        echo -ne "Enter your choice [0-9]: "; ask choice || { echo; exit 0; }
+        echo -ne "Enter your choice [0-10]: "; ask choice || { echo; exit 0; }
         case "$choice" in
             1) configure_tunnel ;;
             2) tunnel_management ;;
@@ -3729,6 +4551,7 @@ main_menu() {
             7) view_logs ;;
             8) update_script ;;
             9) uninstall_ngre ;;
+            10) opt_menu ;;
             0) exit 0 ;;
             *) echo -e "${RED} Invalid option!${NC}" && sleep 1 ;;
         esac
